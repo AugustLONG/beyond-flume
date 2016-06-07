@@ -2,6 +2,7 @@
   (:require [clojure.java.io :as io :refer [file resource writer reader]]
             [clojure.string :as string :refer [trim]]
             [clojure.core.async :refer [chan >!! <!! close! timeout alts!! sliding-buffer]]
+            [aero.core :refer [read-config]]
             [clj-time.core :as t]
             [clj-time.local :as l :refer [format-local-time]]
             [clj-time.periodic :as p]
@@ -30,7 +31,7 @@
 (defn topic-name [[_ & file-pattern]]
   (->> file-pattern (map (partial name)) string/join (str "log-")))
 
-(defn log-reading [topic file-pattern-with-ts]
+(defn log-reading [[zk-servers topic] file-pattern-with-ts]
   (let [filepath (string/join file-pattern-with-ts)
         _ (info "processing file:" filepath)
         filename (-> file-pattern-with-ts rest string/join)
@@ -44,7 +45,8 @@
                                     (commit-fileoffset filename @pending-offset)
                                     (recur)))
         empty-read-back-off 500]
-    (with-open [p (producer {"bootstrap.servers" "10.205.3.23:9092,10.205.3.24:9092,10.205.3.25:9092"} (byte-array-serializer) (byte-array-serializer))]
+    (with-open [p (producer {"bootstrap.servers" (->> zk-servers (map #(str % ":9092")) (string/join ","))}
+                            (byte-array-serializer) (byte-array-serializer))]
       (loop []
         (let [result (first (alts!! [tail-ch (timeout empty-read-back-off)]))]
           (if result
@@ -56,9 +58,9 @@
                 (future-cancel commit-offset)
                 (str "resources/" filename ".bk"))))))))
 
-(defn log-reading-roll [{:keys [file-pattern start-ts end-ts period]}]
+(defn log-reading-roll [{:keys [zk-servers file-pattern start-ts end-ts period]}]
   (info "check and create partition:" (topic-name file-pattern))
-  (with-open [zk (admin/zk-client "10.205.3.23,10.205.3.24,10.205.3.25")]
+  (with-open [zk (admin/zk-client (string/join "," zk-servers))]
        (if-not (admin/topic-exists? zk (topic-name file-pattern))
          (admin/create-topic zk (topic-name file-pattern) {:replication-factor 1})))
   (doseq [ts (p/periodic-seq
@@ -69,15 +71,15 @@
          (re-find #"(\d*)-(\d*)-(\d*)T(\d*):(\d*):(\d*)")
          rest
          (parse-file-pattern file-pattern)
-         (log-reading (topic-name file-pattern)))))
+         (log-reading [zk-servers (topic-name file-pattern)] ))))
 
-(defn -main []
-  (log-reading-roll {:file-pattern ["/data/larluo/var/"
-                                    "BookBase.TLogExplanationServer_qd_readtime_" :year :month :day :hour ".log"]
-                        :start-ts "2016-06-01T00:00:00"
-                        :period (t/hours 1)})
-  #_(log-reading-roll {:file-pattern ["/Users/larluo/work/opt/zookeeper/" "README_packaging.txt"]
-                     :period (t/hours 1)}))
+(defn -main [filepath]
+  (log-reading-roll (-> filepath read-config eval)
+                    #_config-edn-test))
 
 (comment
-    (topics {"zookeeper.connect" "10.205.3.23:2181"}))
+  (def config-edn-test {:file-pattern ["/data/larluo/var/"
+                                  "BookBase.TLogExplanationServer_qd_readtime_" :year :month :day :hour ".log"]
+                   :start-ts "2016-06-01T00:00:00"
+                   :period (clj-time.core/hours 1)})
+  (topics {"zookeeper.connect" "10.205.3.23:2181"}))
